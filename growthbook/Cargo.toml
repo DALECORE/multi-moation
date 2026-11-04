@@ -1,0 +1,12 @@
+[package]
+name = "codex-growthbook"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "GrowthBook-controlled launcher for the public, stable Codex feature settings"
+
+[dependencies]
+anyhow = "1"
+growthbook-rust = "0.4.0"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
