@@ -1,17 +1,13 @@
-use std::collections::HashMap;
-use std::env;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::time::Duration;
+use std::fs;
+use std::path::Path;
 
-use anyhow::{anyhow, bail, Context, Result};
-use growthbook_rust::client::{GrowthBookClient, GrowthBookClientBuilder, GrowthBookClientTrait};
-use growthbook_rust::model_public::GrowthBookAttribute;
+use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
-/// GrowthBook keys are owned by this project and are intentionally namespaced.
-/// Only stable, public Codex settings are mapped. Internal OpenAI rollout keys,
-/// authentication gates, managed-policy controls, and experimental features
-/// are deliberately excluded.
+/// Explicit bridge keys. Exported Claude Code flags (for example, tengu_* and
+/// cai_*) are intentionally not treated as Codex controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FeatureMapping {
     pub growthbook_key: &'static str,
@@ -20,41 +16,13 @@ pub struct FeatureMapping {
 }
 
 pub const FEATURE_MAPPINGS: &[FeatureMapping] = &[
-    FeatureMapping {
-        growthbook_key: "codex.shell_tool",
-        codex_key: "shell_tool",
-        codex_default: true,
-    },
-    FeatureMapping {
-        growthbook_key: "codex.unified_exec",
-        codex_key: "unified_exec",
-        codex_default: true,
-    },
-    FeatureMapping {
-        growthbook_key: "codex.shell_snapshot",
-        codex_key: "shell_snapshot",
-        codex_default: true,
-    },
-    FeatureMapping {
-        growthbook_key: "codex.view_image",
-        codex_key: "view_image",
-        codex_default: true,
-    },
-    FeatureMapping {
-        growthbook_key: "codex.sleep_tool",
-        codex_key: "sleep_tool",
-        codex_default: true,
-    },
-    FeatureMapping {
-        growthbook_key: "codex.hooks",
-        codex_key: "hooks",
-        codex_default: true,
-    },
-    FeatureMapping {
-        growthbook_key: "codex.multi_agent",
-        codex_key: "multi_agent",
-        codex_default: true,
-    },
+    FeatureMapping { growthbook_key: "codex.shell_tool", codex_key: "shell_tool", codex_default: true },
+    FeatureMapping { growthbook_key: "codex.unified_exec", codex_key: "unified_exec", codex_default: true },
+    FeatureMapping { growthbook_key: "codex.shell_snapshot", codex_key: "shell_snapshot", codex_default: true },
+    FeatureMapping { growthbook_key: "codex.view_image", codex_key: "view_image", codex_default: true },
+    FeatureMapping { growthbook_key: "codex.sleep_tool", codex_key: "sleep_tool", codex_default: true },
+    FeatureMapping { growthbook_key: "codex.hooks", codex_key: "hooks", codex_default: true },
+    FeatureMapping { growthbook_key: "codex.multi_agent", codex_key: "multi_agent", codex_default: true },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,100 +32,65 @@ pub struct FeatureDecision {
     pub enabled: bool,
 }
 
-/// Connects to GrowthBook and fetches a fresh feature payload before returning.
-/// Failure is surfaced; callers must not silently launch Codex with stale remote
-/// decisions when GrowthBook was explicitly configured as the control plane.
-pub async fn load_growthbook_client() -> Result<GrowthBookClient> {
-    let sdk_key = env::var("GB_SDK_KEY")
-        .context("GB_SDK_KEY is required (use a GrowthBook SDK client key)")?;
-    if sdk_key.trim().is_empty() {
-        bail!("GB_SDK_KEY must not be empty");
-    }
+/// Load a GrowthBook export directly from disk. Supports a flat export
+/// (key -> native JSON value) and GrowthBook feature envelopes
+/// (key -> { "defaultValue": ... }). No SDK, HTTP client, or network is used.
+pub fn load_export(path: impl AsRef<Path>) -> Result<BTreeMap<String, Value>> {
+    let path = path.as_ref();
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("could not read local GrowthBook export '{}'", path.display()))?;
+    let value: Value = serde_json::from_str(&contents)
+        .with_context(|| format!("invalid JSON in '{}'", path.display()))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("GrowthBook export must be a top-level JSON object"))?;
 
-    let api_url = env::var("GB_URL")
-        .unwrap_or_else(|_| "https://cdn.growthbook.io".to_string());
-
-    let mut builder = GrowthBookClientBuilder::new()
-        .api_url(api_url)
-        .client_key(sdk_key)
-        .ttl(Duration::from_secs(0))
-        .auto_refresh(false);
-
-    if let Ok(decryption_key) = env::var("GB_DECRYPTION_KEY") {
-        if !decryption_key.trim().is_empty() {
-            builder = builder.decryption_key(decryption_key);
-        }
-    }
-
-    // Attributes are opt-in. The launcher does not invent or collect a user ID.
-    if let Ok(raw_attributes) = env::var("GB_ATTRIBUTES_JSON") {
-        let value: Value = serde_json::from_str(&raw_attributes)
-            .context("GB_ATTRIBUTES_JSON must contain a JSON object")?;
-        if !value.is_object() {
-            bail!("GB_ATTRIBUTES_JSON must contain a JSON object");
-        }
-
-        let attributes: HashMap<String, GrowthBookAttribute> =
-            GrowthBookAttribute::from(value)
-                .map_err(|error| anyhow!("invalid GrowthBook attributes: {error}"))?
-                .into_iter()
-                .map(|attribute| (attribute.key.clone(), attribute))
-                .collect();
-        builder = builder.attributes(attributes);
-    }
-
-    builder
-        .build()
-        .await
-        .map_err(|error| anyhow!("GrowthBook feature fetch failed: {error}"))
+    Ok(object.iter().map(|(key, value)| (key.clone(), value.clone())).collect())
 }
 
-/// Evaluates only the allowlisted mappings above. Missing GrowthBook keys are
-/// ignored, preserving the existing Codex config/default for that feature.
-/// Non-boolean values are rejected rather than being coerced.
-pub fn evaluate_codex_flags(client: &GrowthBookClient) -> Result<Vec<FeatureDecision>> {
+fn boolean_value(value: &Value) -> Option<bool> {
+    if let Some(value) = value.as_bool() {
+        return Some(value);
+    }
+    value.get("defaultValue").and_then(Value::as_bool)
+}
+
+/// Evaluate only the explicit Codex allowlist. Unknown keys and unrelated
+/// Claude Code flags are ignored; non-boolean mapped values fail closed.
+pub fn evaluate_codex_flags(
+    features: &BTreeMap<String, Value>,
+) -> Result<Vec<FeatureDecision>> {
     let mut decisions = Vec::new();
-
     for mapping in FEATURE_MAPPINGS {
-        let result = client.feature_result(mapping.growthbook_key, None);
-        if result.source == "unknownFeature" {
+        let Some(value) = features.get(mapping.growthbook_key) else {
             continue;
-        }
-
-        let enabled = result.value_as::<bool>().map_err(|error| {
-            anyhow!(
-                "GrowthBook feature '{}' must resolve to a boolean: {error}",
+        };
+        let enabled = boolean_value(value).ok_or_else(|| {
+            anyhow::anyhow!(
+                "mapped feature '{}' must be a boolean or contain boolean defaultValue",
                 mapping.growthbook_key
             )
         })?;
-
         decisions.push(FeatureDecision {
             growthbook_key: mapping.growthbook_key,
             codex_key: mapping.codex_key,
             enabled,
         });
     }
-
     Ok(decisions)
 }
 
-/// Builds argv without a shell. GrowthBook values can only select a Codex key
-/// from FEATURE_MAPPINGS, so they cannot inject arbitrary command-line options.
+/// Build argv without shell interpolation. Only compile-time allowlisted Codex
+/// keys can be emitted by the evaluator.
 pub fn build_codex_args(
     original_args: &[OsString],
     decisions: &[FeatureDecision],
 ) -> Vec<OsString> {
     let mut args = Vec::with_capacity(decisions.len() * 2 + original_args.len());
-
     for decision in decisions {
-        args.push(OsString::from(if decision.enabled {
-            "--enable"
-        } else {
-            "--disable"
-        }));
+        args.push(OsString::from(if decision.enabled { "--enable" } else { "--disable" }));
         args.push(OsString::from(decision.codex_key));
     }
-
     args.extend(original_args.iter().cloned());
     args
 }
@@ -167,92 +100,63 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    async fn client_with(features: Value) -> GrowthBookClient {
-        GrowthBookClientBuilder::new()
-            .features_json(features)
-            .expect("valid test feature payload")
-            .build()
-            .await
-            .expect("manual feature client should build without network")
-    }
-
-    #[tokio::test]
-    async fn evaluates_only_allowlisted_codex_features() {
-        let client = client_with(json!({
-            "codex.shell_tool": { "defaultValue": false },
-            "codex.unified_exec": { "defaultValue": true },
-            "codex.private_internal_flag": { "defaultValue": true }
-        }))
-        .await;
-
-        let decisions = evaluate_codex_flags(&client).expect("boolean features");
-        assert_eq!(
-            decisions,
-            vec![
-                FeatureDecision {
-                    growthbook_key: "codex.shell_tool",
-                    codex_key: "shell_tool",
-                    enabled: false
-                },
-                FeatureDecision {
-                    growthbook_key: "codex.unified_exec",
-                    codex_key: "unified_exec",
-                    enabled: true
-                }
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_growthbook_keys_leave_codex_defaults_untouched() {
-        let client = client_with(json!({
-            "codex.view_image": { "defaultValue": false }
-        }))
-        .await;
-
-        let decisions = evaluate_codex_flags(&client).expect("valid feature set");
-        assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].codex_key, "view_image");
-        assert!(!decisions[0].enabled);
-    }
-
-    #[tokio::test]
-    async fn rejects_non_boolean_growthbook_values() {
-        let client = client_with(json!({
-            "codex.shell_tool": { "defaultValue": "true" }
-        }))
-        .await;
-
-        let error = evaluate_codex_flags(&client).expect_err("string is not a boolean");
-        assert!(error.to_string().contains("must resolve to a boolean"));
+    fn feature_map(value: Value) -> BTreeMap<String, Value> {
+        value.as_object().unwrap().iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
     }
 
     #[test]
-    fn builds_codex_argv_without_shell_interpolation() {
-        let decisions = vec![
-            FeatureDecision {
-                growthbook_key: "codex.shell_tool",
-                codex_key: "shell_tool",
-                enabled: true,
-            },
-            FeatureDecision {
-                growthbook_key: "codex.unified_exec",
-                codex_key: "unified_exec",
-                enabled: false,
-            },
-        ];
-        let original = vec![OsString::from("-p"), OsString::from("inspect this repo")];
+    fn reads_flat_native_boolean_values_and_ignores_claude_flags() {
+        let features = feature_map(json!({
+            "codex.shell_tool": false,
+            "tengu-agents-md-mod": true,
+            "cai_proud_planet": false,
+            "tengu-off-switch": { "activated": false }
+        }));
+        let decisions = evaluate_codex_flags(&features).unwrap();
+        assert_eq!(decisions, vec![FeatureDecision {
+            growthbook_key: "codex.shell_tool",
+            codex_key: "shell_tool",
+            enabled: false,
+        }]);
+    }
 
-        assert_eq!(
-            build_codex_args(&original, &decisions),
-            vec![
-                OsString::from("--enable"),
-                OsString::from("shell_tool"),
-                OsString::from("--disable"),
-                OsString::from("unified_exec"),
-                OsString::from("-p"),
-                OsString::from("inspect this repo")
-            ]
-        );
+    #[test]
+    fn reads_growthbook_default_value_envelope() {
+        let features = feature_map(json!({
+            "codex.hooks": { "defaultValue": true }
+        }));
+        let decisions = evaluate_codex_flags(&features).unwrap();
+        assert_eq!(decisions[0].codex_key, "hooks");
+        assert!(decisions[0].enabled);
+    }
+
+    #[test]
+    fn missing_keys_leave_codex_defaults_untouched() {
+        let features = feature_map(json!({ "tengu-agents-md-mod": true }));
+        assert!(evaluate_codex_flags(&features).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_non_boolean_mapped_values() {
+        let features = feature_map(json!({ "codex.shell_tool": "true" }));
+        assert!(evaluate_codex_flags(&features).is_err());
+    }
+
+    #[test]
+    fn builds_arguments_without_shell_interpolation() {
+        let decisions = vec![FeatureDecision {
+            growthbook_key: "codex.shell_tool",
+            codex_key: "shell_tool",
+            enabled: false,
+        }];
+        let original = vec![OsString::from("-p"), OsString::from("inspect this repo")];
+        assert_eq!(build_codex_args(&original, &decisions), vec![
+            OsString::from("--disable"),
+            OsString::from("shell_tool"),
+            OsString::from("-p"),
+            OsString::from("inspect this repo"),
+        ]);
     }
 }
