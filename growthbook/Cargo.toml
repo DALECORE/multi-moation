@@ -1,0 +1,10 @@
+[package]
+name = "codex-growthbook"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Offline local-JSON feature bridge for the public Codex CLI"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
